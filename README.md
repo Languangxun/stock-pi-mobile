@@ -11,6 +11,26 @@
 
 ![自选页](docs/screenshot-watch.png)
 
+## 项目结构
+
+```
+stock_pi_mobile/
+├── mobile_gui.py   # 入口 + App（页面组装 / 生命周期 / 后台任务泵）
+├── widgets.py      # 触摸控件 Btn / VScroll / 弹窗 / 字体
+├── helpers.py      # 后端加载 / 格式化 / WiFi(nmcli)
+├── make_picks.py   # 电脑端生成荐股快照
+├── start_mobile.sh # Pi 上循环守护启动
+├── stock_predict.py / stock_cache.db / stock_gui.ini  # 后端（从 stock-analyzer 取）
+└── stock_mobile.ini / picks_cache.json                # 本机配置与快照
+```
+
+触屏要点（widgets.py）：
+
+- 按钮按下高亮、拖出取消、松手坐标 ±8px 容差（电阻屏抖动）
+- 列表拖动 ≥5px 判定为滚动；滚动中不触发行的点按/长按
+- 长按 550ms 弹菜单；拖动会取消长按；松手带惯性滑动
+- 网络/数据库重活全部走后台线程（详情 K 线、AI 上下文、行情、扫描）
+
 ## 功能
 
 | 屏 | 内容 |
@@ -28,10 +48,13 @@
    [stock-analyzer](https://github.com/Languangxun/stock-analyzer) 取后端三件套
    放到同目录（或任意目录用 `--backend` 指定）：
    ```
-   stock_predict.py      # 算法（唯一生成物，勿手改）
+   stock_predict.py      # 算法（唯一生成物，勿手改；保持与开发机同版本）
    stock_cache.db        # 日K缓存
    stock_gui.ini         # 可选：后端配置（API Key 等）
    ```
+   > 界面三文件（mobile_gui.py / widgets.py / helpers.py）需一起更新，
+   > 缺一不可；`rsync` 时注意别覆盖 Pi 上的 `stock_mobile.ini` 与
+   > `picks_cache.json`。
    > 如果从开发机拷 `stock_gui.ini`，记得清掉 `[proxy] url`（开发机代理
    > 在 Pi 上不存在，会导致行情全部失败，界面显示 `--`）。
 2. 系统依赖：

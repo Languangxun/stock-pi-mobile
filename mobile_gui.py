@@ -6,6 +6,11 @@
 只做界面：行情/预测/荐股/AI 全部复用 stock_predict.py（与 stock_gui.py 同源生成物）。
 适配 240x320 竖屏 / 320x240 横屏（自动检测，也可 --size 强制预览）。
 
+模块拆分（2024 重构）：
+  mobile_gui.py   入口 + App（页面组装 / 生命周期 / 任务泵）
+  widgets.py      触摸控件 Btn / VScroll / 弹窗 / 字体
+  helpers.py      后端加载 / 格式化 / WiFi(nmcli)
+
 用法：
   python3 mobile_gui.py --check                 # 只检查后端/数据，不开界面
   python3 mobile_gui.py                         # 小屏自动全屏；桌面默认 240x320 预览窗
@@ -18,45 +23,29 @@
 """
 import argparse
 import configparser
-import importlib.util
 import json
 import os
 import queue
 import re
-import shutil
-import subprocess
-import sys
 import threading
 import time
 import tkinter as tk
-import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
 
+from helpers import (find_backend, load_backend, clamp, fmt_price, fmt_pct,
+                     trunc, human_size, market_state, wifi_available,
+                     wifi_status, wifi_known, wifi_scan, wifi_connect,
+                     wifi_disconnect, wifi_set_static, wifi_set_dhcp,
+                     mem_avail_mb)
+from widgets import (BG, PANEL, PANEL2, ROW_ALT, FG, DIM, LINE, ACCENT,
+                     ACCENT_DK, UP, DOWN, WARN, SEL, Fonts, Btn, VScroll,
+                     Modal, ConfirmDialog, TextDialog, NumPadDialog,
+                     SheetDialog)
+
 APP = "stock-pi-mobile"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 INI_PATH = os.path.join(HERE, "stock_mobile.ini")
-
-# ---------------- 配色（暗色，A股红涨绿跌）----------------
-BG = "#0b0f14"
-PANEL = "#151b23"
-PANEL2 = "#111720"
-ROW_ALT = "#131a22"
-FG = "#e6edf3"
-DIM = "#7d8b9a"
-LINE = "#222c37"
-ACCENT = "#3d8bfd"
-ACCENT_DK = "#12325e"
-UP = "#ff5252"
-DOWN = "#26c281"
-WARN = "#e3b341"
-SEL = "#22303f"
-
-CJK_FONTS = ("Noto Sans CJK SC", "WenQuanYi Zen Hei", "WenQuanYi Micro Hei",
-             "Source Han Sans SC", "Microsoft YaHei", "PingFang SC",
-             "Droid Sans Fallback", "DejaVu Sans")
-MONO_FONTS = ("DejaVu Sans Mono", "Noto Sans Mono CJK SC", "Consolas",
-              "WenQuanYi Zen Hei Mono", "Courier New")
 
 TIER_LIST = ("稳健", "均衡", "激进")
 UNIVERSE_LIST = ("all", "main", "etf", "all_etf")
@@ -66,619 +55,6 @@ MODEL_LIST = ("deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro",
               "deepseek-v4.1-flash", "kimi-k3")
 
 
-# ================= 后端加载（算法复用，零复制） =================
-def find_backend(explicit="", ini_dir=""):
-    cands = []
-    for d in (explicit, os.environ.get("STOCK_BACKEND", ""), ini_dir, HERE,
-              os.path.expanduser("~/stock_predict"),
-              os.path.expanduser("~/ai-quant/scripts/cli")):
-        if d:
-            cands.append(os.path.expanduser(d))
-    for d in cands:
-        p = os.path.join(d, "stock_predict.py")
-        if os.path.isfile(p):
-            return p
-    return None
-
-
-def load_backend(path):
-    spec = importlib.util.spec_from_file_location("stock_backend", path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["stock_backend"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-# ================= 通用小工具 =================
-def clamp(v, lo, hi):
-    return lo if v < lo else (hi if v > hi else v)
-
-
-def fmt_price(v):
-    if v is None:
-        return "--"
-    return f"{v:.2f}" if v < 1000 else f"{v:.0f}"
-
-
-def fmt_pct(v):
-    if v is None:
-        return "--"
-    return f"{v:+.2f}%"
-
-
-def trunc(s, n):
-    s = s or ""
-    return s if len(s) <= n else s[:n - 1] + "…"
-
-
-def human_size(n):
-    for u in ("B", "KB", "MB", "GB"):
-        if n < 1024 or u == "GB":
-            return f"{n:.0f}{u}" if u == "B" else f"{n:.1f}{u}"
-        n /= 1024.0
-
-
-def market_state():
-    t = time.localtime()
-    if t.tm_wday >= 5:
-        return "休市", DIM
-    hm = t.tm_hour * 100 + t.tm_min
-    if 925 <= hm <= 1135 or 1255 <= hm <= 1505:
-        return "交易中", UP
-    if 1135 < hm < 1255:
-        return "午间休市", WARN
-    if hm < 925:
-        return "未开盘", DIM
-    return "已收盘", DIM
-
-
-# ================= WiFi / 网络（nmcli，树莓派/NetworkManager） =================
-def _run(cmd, timeout=25):
-    env = dict(os.environ)
-    env["LC_ALL"] = "C"
-    env["LANG"] = "C"
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           env=env)
-        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
-    except Exception as e:
-        return 1, "", str(e)
-
-
-def wifi_available():
-    return bool(shutil.which("nmcli"))
-
-
-def wifi_device():
-    rc, out, _ = _run(["nmcli", "-t", "-f", "DEVICE,TYPE", "device"], 8)
-    for line in out.splitlines():
-        parts = line.split(":")
-        if len(parts) >= 2 and parts[1] == "wifi":
-            return parts[0]
-    return ""
-
-
-def local_ips():
-    rc, out, _ = _run(["hostname", "-I"], 4)
-    return out.split()
-
-
-def mem_avail_mb():
-    """MemAvailable（MB）；读不到返回 None。"""
-    try:
-        with open("/proc/meminfo", encoding="ascii") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) // 1024
-    except Exception:
-        pass
-    return None
-
-
-def wifi_status():
-    st = {"ssid": "", "signal": "", "ip": "", "dev": wifi_device()}
-    if not st["dev"]:
-        return st
-    rc, out, _ = _run(["nmcli", "-t", "-f", "active,ssid,signal",
-                       "device", "wifi"], 8)
-    for line in out.splitlines():
-        if line.startswith("yes:"):
-            p = line.split(":")
-            st["ssid"] = p[1] if len(p) > 1 else ""
-            st["signal"] = p[2] if len(p) > 2 else ""
-            break
-    if not st["ssid"]:
-        # 冷启动时缓存列表可能为空，退回活动连接的名称
-        st["ssid"] = _wifi_active_conn()
-    ips = local_ips()
-    st["ip"] = ips[0] if ips else ""
-    return st
-
-
-def wifi_known():
-    rc, out, _ = _run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
-                      8)
-    return {line.rsplit(":", 1)[0] for line in out.splitlines()
-            if line.endswith(":802-11-wireless")}
-
-
-def wifi_scan():
-    if not wifi_available():
-        raise RuntimeError("未检测到 nmcli")
-    _run(["nmcli", "device", "wifi", "rescan"], 15)
-    rc, out, err = _run(["nmcli", "-t", "-f", "ssid,signal,security",
-                         "device", "wifi", "list"], 30)
-    if rc != 0 and not out:
-        raise RuntimeError((err or "扫描失败").splitlines()[-1][:60])
-    best = {}
-    for line in out.splitlines():
-        parts = line.split(":")
-        if len(parts) < 3:
-            continue
-        try:
-            sig = int(parts[-2] or 0)
-        except ValueError:
-            continue
-        ssid = ":".join(parts[:-2]).replace("\\:", ":")
-        if not ssid:
-            continue
-        sec = parts[-1] or ""
-        if ssid not in best or sig > best[ssid][0]:
-            best[ssid] = (sig, sec)
-    return sorted(((s, v[0], v[1]) for s, v in best.items()),
-                  key=lambda x: -x[1])
-
-
-def wifi_connect(ssid, password="", timeout=50):
-    cmd = ["nmcli", "--wait", "35", "device", "wifi", "connect", ssid]
-    if password:
-        cmd += ["password", password]
-    rc, out, err = _run(cmd, timeout)
-    if rc != 0:
-        raise RuntimeError(((err or out or "连接失败").splitlines() or [""])[-1][:70])
-
-
-def wifi_disconnect():
-    dev = wifi_device()
-    if not dev:
-        raise RuntimeError("未找到无线网卡")
-    rc, out, err = _run(["nmcli", "device", "disconnect", dev], 20)
-    if rc != 0:
-        raise RuntimeError((err or "断开失败").splitlines()[-1][:60])
-
-
-def _wifi_active_conn():
-    rc, out, _ = _run(["nmcli", "-t", "-f", "NAME,TYPE", "connection",
-                       "show", "--active"])
-    for line in out.splitlines():
-        if line.endswith(":802-11-wireless"):
-            return line.rsplit(":", 1)[0]
-    return ""
-
-
-def wifi_set_static(ip, gateway="", dns=""):
-    name = _wifi_active_conn()
-    if not name:
-        raise RuntimeError("当前没有已连接的 WiFi")
-    args = ["nmcli", "connection", "modify", name, "ipv4.method", "manual",
-            "ipv4.addresses", f"{ip}/24"]
-    if gateway:
-        args += ["ipv4.gateway", gateway]
-    if dns:
-        args += ["ipv4.dns", dns]
-    rc, out, err = _run(args, 20)
-    if rc != 0:
-        raise RuntimeError((err or "设置失败").splitlines()[-1][:60])
-    rc, out, err = _run(["nmcli", "connection", "up", name], 45)
-    if rc != 0:
-        raise RuntimeError((err or "应用失败").splitlines()[-1][:60])
-
-
-def wifi_set_dhcp():
-    name = _wifi_active_conn()
-    if not name:
-        raise RuntimeError("当前没有已连接的 WiFi")
-    rc, out, err = _run(["nmcli", "connection", "modify", name,
-                         "ipv4.method", "auto", "ipv4.addresses", "",
-                         "ipv4.gateway", ""], 20)
-    if rc != 0:
-        raise RuntimeError((err or "设置失败").splitlines()[-1][:60])
-    rc, out, err = _run(["nmcli", "connection", "up", name], 45)
-    if rc != 0:
-        raise RuntimeError((err or "应用失败").splitlines()[-1][:60])
-
-
-# ================= 字体 =================
-class Fonts:
-    def __init__(self, root, scale):
-        fam = set(tkfont.families(root))
-        self.cjk = next((f for f in CJK_FONTS if f in fam), "TkDefaultFont")
-        self.mono = next((f for f in MONO_FONTS if f in fam), self.cjk)
-        self.s = scale
-        self.corr = self._calibrate(root, self.cjk)
-
-    @staticmethod
-    def _calibrate(root, family):
-        """实测“请求像素字号 → 实际渲染高度”的比例，兼容 HiDPI 缩放。"""
-        try:
-            cv = tk.Canvas(root, width=8, height=8)
-            item = cv.create_text(0, 0, text="汉Ag", anchor="nw",
-                                  font=(family, -100))
-            box = cv.bbox(item)
-            cv.destroy()
-            if box and box[3] > box[1]:
-                return max(0.5, (box[3] - box[1]) / 100.0)
-        except Exception:
-            pass
-        return 1.4
-
-    def _sz(self, n):
-        # 负数字号 = 像素；再按实测比例校正，保证小屏排版一致
-        px = n * 1.35 * self.s / self.corr
-        return -max(4, int(round(px)))
-
-    def f(self, n, bold=False):
-        return (self.cjk, self._sz(n), "bold") if bold else (self.cjk, self._sz(n))
-
-    def m(self, n, bold=False):
-        return (self.mono, self._sz(n), "bold") if bold else (self.mono, self._sz(n))
-
-
-# ================= 触摸控件 =================
-class Btn(tk.Label):
-    def __init__(self, master, text="", command=None, *, bg=PANEL, fg=FG,
-                 font=None, padx=6, pady=3, **kw):
-        super().__init__(master, text=text, bg=bg, fg=fg, font=font,
-                         padx=padx, pady=pady, **kw)
-        self._command = command
-        self._bg = bg
-        self.bind("<ButtonPress-1>", self._press)
-        self.bind("<ButtonRelease-1>", self._release)
-        self.bind("<Leave>", lambda e: self.configure(bg=self._bg))
-
-    def _press(self, _e):
-        if self._command:
-            self.configure(bg=SEL)
-
-    def _release(self, e):
-        self.configure(bg=self._bg)
-        if (self._command and 0 <= e.x <= self.winfo_width()
-                and 0 <= e.y <= self.winfo_height()):
-            self._command()
-
-    def set_text(self, text):
-        self.configure(text=text)
-
-    def set_bg(self, bg):
-        self._bg = bg
-        self.configure(bg=bg)
-
-
-class VScroll(tk.Frame):
-    """Canvas 版滚动容器：支持触摸拖动滚动、点击/长按回调、滚轮。"""
-
-    def __init__(self, master, bg=BG):
-        super().__init__(master, bg=bg)
-        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.inner = tk.Frame(self.canvas, bg=bg)
-        self._win = self.canvas.create_window((0, 0), window=self.inner,
-                                              anchor="nw")
-        self.inner.bind("<Configure>", self._on_inner)
-        self.canvas.bind("<Configure>", self._on_canvas)
-        self.canvas.bind("<MouseWheel>", lambda e: self.scroll_px(-e.delta / 2))
-        self.canvas.bind("<Button-4>", lambda e: self.scroll_px(-24))
-        self.canvas.bind("<Button-5>", lambda e: self.scroll_px(24))
-        self._py = 0
-        self._moved = False
-        self._job = None
-        self._v = 0.0
-        self._kin = None
-
-    def _on_inner(self, _e=None):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
-    def _on_canvas(self, e):
-        self.canvas.itemconfigure(self._win, width=e.width)
-
-    def clear(self):
-        for w in self.inner.winfo_children():
-            w.destroy()
-
-    def scroll_px(self, dy):
-        bbox = self.canvas.bbox("all")
-        if not bbox:
-            return
-        total = bbox[3] - bbox[1]
-        vis = self.canvas.winfo_height()
-        if total <= vis:
-            return
-        top = clamp(self.canvas.canvasy(0) - dy, 0, total - vis)
-        self.canvas.yview_moveto(top / total)
-
-    def bind_row(self, widget, on_tap=None, on_long=None, recursive=True):
-        widgets = [widget]
-        if recursive:
-            stack = list(widget.winfo_children())
-            while stack:
-                w = stack.pop()
-                widgets.append(w)
-                stack.extend(w.winfo_children())
-        for w in widgets:
-            w._tap_cb = on_tap
-            w._long_cb = on_long
-            w.bind("<ButtonPress-1>", self._row_press, add="+")
-            w.bind("<B1-Motion>", self._row_motion, add="+")
-            w.bind("<ButtonRelease-1>", self._row_release, add="+")
-
-    def _row_press(self, e):
-        self._cancel_job()
-        self._cancel_kinetic()
-        self._py = e.y_root
-        self._moved = False
-        self._v = 0.0
-        w = e.widget
-        if getattr(w, "_long_cb", None):
-            self._job = w.after(550, lambda: self._fire_long(w))
-
-    def _fire_long(self, w):
-        self._moved = True
-        cb = getattr(w, "_long_cb", None)
-        try:
-            if cb and w.winfo_exists():
-                cb(w)
-        except Exception:
-            pass
-
-    def _row_motion(self, e):
-        dy = e.y_root - self._py
-        if abs(dy) >= 5:
-            self._cancel_job()
-            self._moved = True
-            self.scroll_px(dy)
-            self._v = 0.6 * self._v + 0.4 * dy
-            self._py = e.y_root
-
-    def _row_release(self, e):
-        self._cancel_job()
-        w = e.widget
-        cb = getattr(w, "_tap_cb", None)
-        if cb and not self._moved:
-            try:
-                if w.winfo_exists():
-                    cb(w)
-            except Exception:
-                pass
-        elif self._moved and abs(self._v) >= 4:
-            self._kinetic_step()
-
-    def _cancel_kinetic(self):
-        if self._kin is not None:
-            try:
-                self.after_cancel(self._kin)
-            except Exception:
-                pass
-            self._kin = None
-
-    def _kinetic_step(self):
-        self._kin = None
-        self._v *= 0.86
-        if abs(self._v) < 1.5:
-            self._v = 0.0
-            return
-        self.scroll_px(self._v)
-        bbox = self.canvas.bbox("all")
-        if not bbox:
-            return
-        total = bbox[3] - bbox[1]
-        vis = self.canvas.winfo_height()
-        top = self.canvas.canvasy(0) - self._v
-        if top <= 0 or top >= total - vis:
-            self._v = 0.0
-            return
-        self._kin = self.after(30, self._kinetic_step)
-
-    def _cancel_job(self):
-        if self._job is not None:
-            try:
-                self.after_cancel(self._job)
-            except Exception:
-                pass
-            self._job = None
-
-
-class Modal(tk.Toplevel):
-    def __init__(self, app, w, h, title=""):
-        super().__init__(app.root)
-        self.app = app
-        self.overrideredirect(True)
-        self.configure(bg=LINE)
-        w, h = int(w), int(h)
-        x = app.root.winfo_rootx() + max(0, (app.W - w) // 2)
-        y = app.root.winfo_rooty() + max(0, (app.H - h) // 2)
-        self.geometry(f"{w}x{h}+{x}+{y}")
-        self.transient(app.root)
-        self.body = tk.Frame(self, bg=BG)
-        self.body.pack(fill="both", expand=True, padx=1, pady=1)
-        if title:
-            tk.Label(self.body, text=title, bg=PANEL, fg=FG,
-                     font=app.fnt.f(10, True)).pack(fill="x", ipady=3)
-        self.bind("<Escape>", lambda e: self.close())
-        # 等窗口真正映射后再抢焦点（fbdev/轻量 WM 上立即 grab 会报 not viewable）
-        self.after(80, self._grab_when_viewable)
-
-    def _grab_when_viewable(self, tries=0):
-        try:
-            if self.winfo_viewable():
-                try:
-                    self.grab_set()
-                except tk.TclError:
-                    pass
-                return
-        except tk.TclError:
-            return
-        if tries < 25:
-            self.after(120, lambda: self._grab_when_viewable(tries + 1))
-
-    def _stop_keyboard(self):
-        kb = getattr(self, "_kb", None)
-        if kb:
-            try:
-                kb.terminate()
-            except Exception:
-                pass
-            self._kb = None
-
-    def close(self):
-        self._stop_keyboard()
-        try:
-            self.grab_release()
-        except Exception:
-            pass
-        self.destroy()
-
-
-class ConfirmDialog(Modal):
-    def __init__(self, app, text, on_ok, ok_text="确定"):
-        super().__init__(app, app.W - 30, 120, "请确认")
-        tk.Label(self.body, text=text, bg=BG, fg=FG, wraplength=app.W - 46,
-                 justify="left", font=app.fnt.f(10)).pack(
-                     fill="both", expand=True, padx=8, pady=6)
-        bar = tk.Frame(self.body, bg=BG)
-        bar.pack(fill="x", pady=4)
-        Btn(bar, "取消", self.close, font=app.fnt.f(10),
-            bg=PANEL2, padx=10, pady=5).pack(side="left", expand=True, padx=6)
-        Btn(bar, ok_text, lambda: (self.close(), on_ok()),
-            font=app.fnt.f(10, True), bg=ACCENT, fg="#08101c",
-            padx=10, pady=5).pack(side="right", expand=True, padx=6)
-
-
-class TextDialog(Modal):
-    """文本输入框：小屏自带触摸键盘（数字/字母/常用符号）。"""
-
-    KB_ROWS = ("1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm.-_")
-
-    def __init__(self, app, title, initial, on_ok, show=None, hint=""):
-        kb = app.W <= 480
-        self._row_h = int(24 * app.scale)
-        self._bot_h = int(28 * app.scale)
-        kb_h = 0 if not kb else (len(self.KB_ROWS) * self._row_h + self._bot_h)
-        super().__init__(app, min(app.W - 16, 330),
-                         110 + kb_h, title)
-        self.app = app
-        self.on_ok = on_ok
-        if hint:
-            tk.Label(self.body, text=hint, bg=BG, fg=DIM,
-                     font=app.fnt.f(8), wraplength=app.W - 44).pack(
-                         fill="x", padx=8, pady=(3, 0))
-        self.var = tk.StringVar(value=initial or "")
-        ent = tk.Entry(self.body, textvariable=self.var, show=show or "",
-                       bg=PANEL2, fg=FG, insertbackground=FG,
-                       font=app.fnt.f(11), relief="flat",
-                       highlightthickness=0)
-        ent.pack(fill="x", padx=8, pady=5, ipady=3)
-        ent.focus_set()
-        if kb:
-            self._build_kb()
-        else:
-            bar = tk.Frame(self.body, bg=BG)
-            bar.pack(fill="x", pady=4)
-            Btn(bar, "取消", self.close, font=app.fnt.f(10),
-                bg=PANEL2, padx=10, pady=5).pack(side="left", expand=True,
-                                                 padx=6)
-            Btn(bar, "保存", self._ok,
-                font=app.fnt.f(10, True), bg=ACCENT, fg="#08101c",
-                padx=10, pady=5).pack(side="right", expand=True, padx=6)
-        ent.bind("<Return>", lambda e: self._ok())
-        self.after(200, lambda: ent.focus_force())
-
-    def _ok(self):
-        self.on_ok(self.var.get())
-        self.close()
-
-    def _build_kb(self):
-        self._shift = False
-        self._letters = {}
-        holder = tk.Frame(self.body, bg=BG)
-        holder.pack(fill="both", expand=True, padx=4, pady=(0, 3))
-        for chars in self.KB_ROWS:
-            row = tk.Frame(holder, bg=BG, height=self._row_h)
-            row.pack(fill="x")
-            row.pack_propagate(False)
-            for ch in chars:
-                b = Btn(row, ch, lambda c=ch: self._key(c),
-                        font=self.app.fnt.f(9), bg=PANEL2)
-                b.pack(side="left", fill="both", expand=True, padx=1, pady=1)
-                if ch.isalpha():
-                    self._letters[ch] = b
-        bot = tk.Frame(holder, bg=BG, height=self._bot_h)
-        bot.pack(fill="x")
-        bot.pack_propagate(False)
-        specs = (("取消", self.close), ("⇧", self._toggle_shift),
-                 ("空格", lambda: self._key(" ")),
-                 ("⌫", lambda: self.var.set(self.var.get()[:-1])),
-                 ("保存", self._ok))
-        for label, cmd in specs:
-            bg = ACCENT if label == "保存" else PANEL2
-            fg = "#08101c" if label == "保存" else FG
-            Btn(bot, label, cmd, font=self.app.fnt.f(10, label == "保存"),
-                bg=bg, fg=fg).pack(side="left", fill="both", expand=True,
-                                   padx=1, pady=1)
-
-    def _key(self, ch):
-        if self._shift and ch.isalpha():
-            ch = ch.upper()
-        self.var.set(self.var.get() + ch)
-
-    def _toggle_shift(self):
-        self._shift = not self._shift
-        for ch, b in self._letters.items():
-            b.set_text(ch.upper() if self._shift else ch)
-
-
-class NumPadDialog(Modal):
-    def __init__(self, app, title, initial, on_ok, hint=""):
-        super().__init__(app, app.W - 24, 236, title)
-        if hint:
-            tk.Label(self.body, text=hint, bg=BG, fg=DIM,
-                     font=app.fnt.f(8)).pack(fill="x", padx=8, pady=(3, 0))
-        self.var = tk.StringVar(value=initial or "")
-        tk.Label(self.body, textvariable=self.var, bg=PANEL2, fg=FG,
-                 font=app.fnt.m(14, True), anchor="e").pack(
-                     fill="x", padx=8, pady=4, ipady=3)
-        grid = tk.Frame(self.body, bg=BG)
-        grid.pack(fill="both", expand=True, padx=6)
-        keys = (("1", "2", "3", "4"), ("5", "6", "7", "8"),
-                ("9", "0", "⌫", "确定"))
-        for r, row in enumerate(keys):
-            grid.rowconfigure(r, weight=1)
-            for c, k in enumerate(row):
-                grid.columnconfigure(c, weight=1, uniform="k")
-                if k == "确定":
-                    cmd = lambda: (on_ok(self.var.get()), self.close())
-                    b = Btn(grid, k, cmd, font=app.fnt.f(10, True),
-                            bg=ACCENT, fg="#08101c")
-                elif k == "⌫":
-                    cmd = lambda: self.var.set(self.var.get()[:-1])
-                    b = Btn(grid, k, cmd, font=app.fnt.f(12), bg=PANEL2)
-                else:
-                    cmd = lambda kk=k: self.var.set(self.var.get() + kk)
-                    b = Btn(grid, k, cmd, font=app.fnt.f(13), bg=PANEL)
-                b.grid(row=r, column=c, sticky="nsew", padx=2, pady=2)
-
-
-class SheetDialog(Modal):
-    def __init__(self, app, title, items):
-        super().__init__(app, app.W - 40, 40 + 34 * len(items) + 40, title)
-        for label, cb in items:
-            Btn(self.body, label, lambda f=cb: (self.close(), f()),
-                font=app.fnt.f(10), bg=PANEL).pack(
-                    fill="x", padx=8, pady=2, ipady=5)
-        Btn(self.body, "取消", self.close, font=app.fnt.f(10),
-            bg=PANEL2).pack(fill="x", padx=8, pady=(6, 2), ipady=5)
-
-
-# ================= 主程序 =================
 class App:
     REFRESH_MS = 30000
 
@@ -917,9 +293,11 @@ class App:
                          name=f"task-{key}").start()
 
     def _pump(self):
+        got = False
         try:
             while True:
                 kind, key, val, tok = self.q.get_nowait()
+                got = True
                 if kind == "prog":
                     if self.tokens.get(key) is tok:
                         self.set_status(str(val))
@@ -939,7 +317,10 @@ class App:
                         self.toast(f"失败：{trunc(str(val), 24)}")
         except queue.Empty:
             pass
-        self.root.after(80, self._pump)
+        # 空闲时降频，减少定时器唤醒（小内存设备省电/省 CPU）
+        busy = bool(self.jobs)
+        delay = 40 if (got and busy) else (80 if busy else 200)
+        self.root.after(delay, self._pump)
 
     def set_status(self, text):
         self.lbl_status.configure(text=trunc(text, int(self.W / (6.4 * self.scale))))
@@ -1257,13 +638,21 @@ class App:
         q = self.quotes.get(code)
         if q:
             self._detail_header(q, None)
-        cached = self._detail_cached_rows(code)
-        self._draw_chart(cached, None)
+        # K线取数放后台：缓存过期时 get_daily 会联网，不能卡住触摸
+        self.submit("detail_rows", lambda _p: self._detail_cached_rows(code),
+                    on_done=lambda rows, c=code: self._on_detail_rows(c, rows),
+                    on_error=lambda e: None)
         self._detail_analyze(True)
 
     def close_detail(self):
         self.tokens.pop("analyze", None)
+        self.tokens.pop("detail_rows", None)
         self.detail.place_forget()
+
+    def _on_detail_rows(self, code, rows):
+        if code != self.detail_code:
+            return
+        self._draw_chart(rows, self.detail_res)
 
     def _detail_cached_rows(self, code):
         try:
@@ -1434,11 +823,21 @@ class App:
             cv.create_line(xv(i), yv(r["high"]), xv(i), yv(r["low"]),
                            fill=c, width=max(1, int(bw * 0.72)))
         closes = [r["close"] for r in rows]
+        # MA20 用滑动窗口一次算完（原实现每个点都重算 sum，O(n*20)）
+        ma20 = [None] * len(closes)
+        s = 0.0
+        for j, c in enumerate(closes):
+            s += c
+            if j >= 20:
+                s -= closes[j - 20]
+            if j >= 4:
+                ma20[j] = s / (min(j, 19) + 1)
         pts = []
-        for j in range(len(rows) - n, len(rows)):
-            seg = closes[max(0, j - 19):j + 1]
-            if len(seg) >= 5:
-                pts += [xv(j - (len(rows) - n)), yv(sum(seg) / len(seg))]
+        base = len(rows) - n
+        for j in range(base, len(rows)):
+            v = ma20[j]
+            if v is not None:
+                pts += [xv(j - base), yv(v)]
         if len(pts) >= 4:
             cv.create_line(*pts, fill="#ffa94d", width=1)
         last = data[-1]["close"]
@@ -2023,15 +1422,28 @@ class App:
         self.ai_send_btn.pack(side="right", fill="y", padx=(0, 3), pady=2)
 
     def _render_chat(self):
+        """增量渲染：只追加新消息（原实现每来一条回复就全量重建，长会话会卡）。"""
         vs = self.ai_scroll
-        vs.clear()
+        done_n = getattr(self, "_chat_rendered", 0)
+        if len(self.ai_msgs) < done_n:
+            vs.clear()
+            self._chat_placeholder = None
+            done_n = 0
         if not self.ai_msgs:
-            tk.Label(vs.inner, text="点下方预设问题，或输入后回车。\n"
-                                    "AI 已带大盘/自选/荐股上下文。",
-                     bg=BG, fg=DIM, font=self.fnt.f(9), justify="left",
-                     wraplength=self.W - 20).pack(padx=8, pady=12, anchor="w")
+            if not done_n and getattr(self, "_chat_placeholder", None) is None:
+                self._chat_placeholder = tk.Label(
+                    vs.inner,
+                    text="点下方预设问题，或输入后回车。\n"
+                         "AI 已带大盘/自选/荐股上下文。",
+                    bg=BG, fg=DIM, font=self.fnt.f(9), justify="left",
+                    wraplength=self.W - 20)
+                self._chat_placeholder.pack(padx=8, pady=12, anchor="w")
             return
-        for m in self.ai_msgs:
+        ph = getattr(self, "_chat_placeholder", None)
+        if ph is not None:
+            ph.destroy()
+            self._chat_placeholder = None
+        for m in self.ai_msgs[done_n:]:
             user = m.get("role") == "user"
             bg = ACCENT_DK if user else PANEL
             txt = m.get("content", "")
@@ -2043,6 +1455,7 @@ class App:
             tk.Label(bubble, text=txt, bg=bg, fg=FG, font=self.fnt.f(9),
                      justify="left", anchor="w", wraplength=int(self.W * 0.72)).pack(
                          fill="x", padx=5, pady=3)
+        self._chat_rendered = len(self.ai_msgs)
         vs.inner.update_idletasks()
         vs.canvas.yview_moveto(1.0)
 
@@ -2085,18 +1498,22 @@ class App:
             self._show("settings")
             return
         first = not self.ai_msgs
-        prompt = (self._ai_context() + "\n\n问题：" + text) if first else text
-        msgs = self.ai_msgs + [{"role": "user", "content": prompt}]
+        base_msgs = list(self.ai_msgs)
         self.ai_send_btn.configure(text="思考…")
         self.ai_send_btn._command = None
         self.set_status("AI 思考中…")
 
         def work(_p):
-            return self.sp._deepseek_chat(
+            # 上下文构建（含DB查询/行情拼接）也放后台，避免卡住触摸
+            prompt = (self._ai_context() + "\n\n问题：" + text) if first else text
+            msgs = base_msgs + [{"role": "user", "content": prompt}]
+            reply = self.sp._deepseek_chat(
                 key, msgs, model=self.sp.AI_MODEL, timeout=120,
                 session=self.sp._ai_session_id("mobile", self.sp.AI_MODEL))
+            return msgs, reply
 
-        def done(reply):
+        def done(result):
+            msgs, reply = result
             self.ai_msgs = msgs + [{"role": "assistant", "content": reply}]
             try:
                 self.sp.ai_session_save("mobile", self.ai_msgs, "",
