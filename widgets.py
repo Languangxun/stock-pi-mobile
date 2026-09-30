@@ -176,6 +176,8 @@ class VScroll(tk.Frame):
         self._job = None
         self._v = 0.0
         self._kin = None
+        # 背景空白处也能拖动（无子控件的区域）
+        self.bind_row(self.canvas, recursive=False)
 
     def _on_inner(self, _e=None):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -212,6 +214,10 @@ class VScroll(tk.Frame):
             w.bind("<ButtonPress-1>", self._row_press, add="+")
             w.bind("<B1-Motion>", self._row_motion, add="+")
             w.bind("<ButtonRelease-1>", self._row_release, add="+")
+
+    def bind_area(self, widget, recursive=True):
+        """纯展示内容（聊天气泡/详情行/提示标签）：只加拖动+惯性，无点击回调。"""
+        self.bind_row(widget, on_tap=None, on_long=None, recursive=recursive)
 
     def _row_press(self, e):
         self._cancel_job()

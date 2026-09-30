@@ -404,8 +404,10 @@ class App:
         vs.clear()
         self.qrows = {}
         if not self.watchlist:
-            tk.Label(vs.inner, text="点【＋ 加自选】添加股票代码",
-                     bg=BG, fg=DIM, font=self.fnt.f(10)).pack(pady=20)
+            lbl = tk.Label(vs.inner, text="点【＋ 加自选】添加股票代码",
+                           bg=BG, fg=DIM, font=self.fnt.f(10))
+            lbl.pack(pady=20)
+            vs.bind_area(lbl)
         for i, code in enumerate(self.watchlist):
             name = self.names.get(code, "") or code[-6:]
             bg = ROW_ALT if i % 2 else PANEL
@@ -767,10 +769,12 @@ class App:
                      font=self.fnt.f(9), justify="left", anchor="w",
                      wraplength=self.W - (52 if label else 14)).pack(
                          side="left", fill="x", expand=True, padx=4, pady=2)
+            vs.bind_area(row)  # 详情行也能拖动滚动
         if res.get("quick"):
-            tk.Label(vs.inner, text="※ 快速预览；点【完整分析】补全样本池",
-                     bg=BG, fg=WARN, font=self.fnt.f(8)).pack(
-                         anchor="w", padx=6, pady=4)
+            lbl = tk.Label(vs.inner, text="※ 快速预览；点【完整分析】补全样本池",
+                           bg=BG, fg=WARN, font=self.fnt.f(8))
+            lbl.pack(anchor="w", padx=6, pady=4)
+            vs.bind_area(lbl)
 
     def _draw_chart(self, rows, res=None):
         self._chart_rows = rows or []
@@ -976,9 +980,10 @@ class App:
         self.w_lbl_state.configure(text="不可用", fg=WARN)
         vs = self.w_scroll
         vs.clear()
-        tk.Label(vs.inner, text=text, bg=BG, fg=WARN, font=self.fnt.f(9),
-                 wraplength=self.W - 16, justify="left").pack(
-                     padx=6, pady=10, anchor="w")
+        lbl = tk.Label(vs.inner, text=text, bg=BG, fg=WARN, font=self.fnt.f(9),
+                       wraplength=self.W - 16, justify="left")
+        lbl.pack(padx=6, pady=10, anchor="w")
+        vs.bind_area(lbl)
 
     def _render_wifi(self, st, nets):
         self._wifi_st = st
@@ -992,8 +997,10 @@ class App:
         known = wifi_known()
         preset = self._ini("wifi", "ssid", "lan")
         if not nets:
-            tk.Label(vs.inner, text="未扫描到网络", bg=BG, fg=DIM,
-                     font=self.fnt.f(9)).pack(pady=10)
+            lbl = tk.Label(vs.inner, text="未扫描到网络", bg=BG, fg=DIM,
+                           font=self.fnt.f(9))
+            lbl.pack(pady=10)
+            vs.bind_area(lbl)
             return
         for net_ssid, sig, sec in nets:
             bg = PANEL2 if net_ssid == ssid else PANEL
@@ -1298,13 +1305,16 @@ class App:
         vs.clear()
         msg = str(err)
         self.lbl_gate.configure(text=title, fg=WARN)
-        tk.Label(vs.inner, text=trunc(msg, 90), bg=BG, fg=WARN,
-                 font=self.fnt.f(9), wraplength=self.W - 16,
-                 justify="left").pack(padx=6, pady=8, anchor="w")
+        lbl = tk.Label(vs.inner, text=trunc(msg, 90), bg=BG, fg=WARN,
+                       font=self.fnt.f(9), wraplength=self.W - 16,
+                       justify="left")
+        lbl.pack(padx=6, pady=8, anchor="w")
+        vs.bind_area(lbl)
         if self.sp.np is not None:
-            Btn(vs.inner, "本地扫描荐股（慢）", self._picks_fallback,
-                font=self.fnt.f(9), bg=PANEL).pack(padx=6, pady=4,
-                                                    anchor="w")
+            b = Btn(vs.inner, "本地扫描荐股（慢）", self._picks_fallback,
+                    font=self.fnt.f(9), bg=PANEL)
+            b.pack(padx=6, pady=4, anchor="w")
+            vs.bind_area(b)
 
     def _picks_fallback(self):
         def work(prog):
@@ -1315,8 +1325,10 @@ class App:
             vs.clear()
             self.lbl_gate.configure(text="本地扫描（无三档）", fg=DIM)
             if not picks:
-                tk.Label(vs.inner, text="今日无入围标的", bg=BG, fg=DIM,
-                         font=self.fnt.f(9)).pack(pady=10)
+                lbl = tk.Label(vs.inner, text="今日无入围标的", bg=BG, fg=DIM,
+                               font=self.fnt.f(9))
+                lbl.pack(pady=10)
+                vs.bind_area(lbl)
                 return
             for code, name, close, chg, score, reasons, band in picks:
                 self._pick_row(vs, code, name, close, chg, score,
@@ -1438,6 +1450,7 @@ class App:
                     bg=BG, fg=DIM, font=self.fnt.f(9), justify="left",
                     wraplength=self.W - 20)
                 self._chat_placeholder.pack(padx=8, pady=12, anchor="w")
+                vs.bind_area(self._chat_placeholder)
             return
         ph = getattr(self, "_chat_placeholder", None)
         if ph is not None:
@@ -1455,6 +1468,7 @@ class App:
             tk.Label(bubble, text=txt, bg=bg, fg=FG, font=self.fnt.f(9),
                      justify="left", anchor="w", wraplength=int(self.W * 0.72)).pack(
                          fill="x", padx=5, pady=3)
+            vs.bind_area(bubble)  # 气泡上也能拖动滚动
         self._chat_rendered = len(self.ai_msgs)
         vs.inner.update_idletasks()
         vs.canvas.yview_moveto(1.0)
@@ -1543,8 +1557,10 @@ class App:
         vs = self.set_scroll.inner
 
         def section(title):
-            tk.Label(vs, text=title, bg=BG, fg=ACCENT, font=self.fnt.f(9, True),
-                     anchor="w").pack(fill="x", padx=5, pady=(6, 1))
+            lbl = tk.Label(vs, text=title, bg=BG, fg=ACCENT,
+                           font=self.fnt.f(9, True), anchor="w")
+            lbl.pack(fill="x", padx=5, pady=(6, 1))
+            self.set_scroll.bind_area(lbl)
 
         def row(label, key, command=None, hint=""):
             f = tk.Frame(vs, bg=PANEL, height=self.row_h)
@@ -1561,6 +1577,8 @@ class App:
             if command:
                 # 触摸：拖动=滚动，抬起未移动才算点击
                 self.set_scroll.bind_row(f, on_tap=lambda w, cmd=command: cmd())
+            else:
+                self.set_scroll.bind_area(f)
             if hint:
                 v.configure(text=hint)
             self.set_labels[key] = v
@@ -1596,11 +1614,12 @@ class App:
         row("涨跌色", "updown", self._toggle_updown)
 
         section("关于")
-        tk.Label(vs, text=f"{APP} v{VERSION}\n后端：{self.backend_path}\n"
-                          "仅统计参考，不构成投资建议。",
-                 bg=BG, fg=DIM, font=self.fnt.f(8), justify="left",
-                 anchor="w", wraplength=self.W - 16).pack(
-                     fill="x", padx=6, pady=6)
+        about = tk.Label(vs, text=f"{APP} v{VERSION}\n后端：{self.backend_path}\n"
+                                  "仅统计参考，不构成投资建议。",
+                         bg=BG, fg=DIM, font=self.fnt.f(8), justify="left",
+                         anchor="w", wraplength=self.W - 16)
+        about.pack(fill="x", padx=6, pady=6)
+        self.set_scroll.bind_area(about)
         self._refresh_settings_view()
         self._load_data_status()
 
